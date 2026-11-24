@@ -6,3 +6,7 @@ openpyxl
 pytest
 openai
 pymongo
+scikit-learn
+fastapi
+uvicorn
+httpx

@@ -1,7 +1,10 @@
 # AGENTS.md: đọc file này TRƯỚC mỗi lần chỉnh sửa hoặc chạy test
 
-**EOQ Bánh Kẹo Chợ** giúp tiểu thương quyết định *hôm nay nhập ở đâu, mua gì, bao nhiêu* cho nhiều mặt hàng thực phẩm
-(hạn dùng, hư hỏng, nhiệt độ, vốn, sức chứa). Python + Streamlit; trợ lý AI dùng OpenAI; sổ kiểm kho lưu ở MongoDB.
+**SmartStock AI** gợi ý nhập hàng cho tiểu thương bán hàng có hạn dùng, có mùa vụ: *còn bao nhiêu, có cần đặt không, đặt
+bao nhiêu, muộn nhất ngày nào*. Dự án có HAI giao diện dùng chung lõi `tinh_toan/`:
+
+- **Bản web V1.1** (chính): FastAPI `may_chu/` + giao diện `web/`, nhiều vai trò, lưu MongoDB. Xem **mục 0**.
+- **Bản phân tích cũ**: Streamlit `app.py` + `giao_dien/` (nhập gộp nhiều mặt hàng, mô phỏng, trợ lý AI). Xem mục 1–6.
 
 | Cần biết | Đọc ở đâu |
 |---|---|
@@ -12,14 +15,119 @@
 
 ---
 
+## 0. Bản web SmartStock AI V1.1
+
+Đặc tả: [tai_lieu/DAC_TA_V1.1.md](tai_lieu/DAC_TA_V1.1.md). Chạy: `python -m uvicorn may_chu.ung_dung:app --port 8600`.
+
+### 0.1 Sơ đồ tầng (tầng trên chỉ gọi tầng dưới)
+
+```mermaid
+flowchart TD
+  subgraph WEB["web/ (trình duyệt)"]
+    UD["js/ung_dung.js<br/>đăng nhập, MENU theo vai trò, định tuyến"] --> CKJ["js/chu_kho.js<br/>6 màn hình chủ kho"]
+    UD --> CB["js/cac_ben.js<br/>chủ hàng, quản trị, nhà cung cấp"]
+    UD --> HD["js/huong_dan.js<br/>hướng dẫn + sơ đồ bấm được"]
+    CKJ --> CT["js/chi_tiet.js + js/bieu_do.js"]
+    CB --> CT
+    CKJ --> NT["js/nen_tang.js: goi() API, định dạng, thẻ 3 câu"]
+  end
+  NT -->|"/api/... + Bearer token"| API
+  subgraph MC["may_chu/ (FastAPI)"]
+    API["ung_dung.py<br/>đường dẫn + kiểm tra vai trò"] --> XT["xac_thuc.py<br/>token → tài khoản"]
+    API --> DV["dich_vu.py<br/>nghiệp vụ, câu chữ"]
+    DV --> KDL["kho_du_lieu.py<br/>PhamVi(ma_kho) → MongoDB / file"]
+    DM["du_lieu_mau.py"] --> DV
+  end
+  API --> ND["tro_ly_ai/nhan_dien.py<br/>ảnh, giải thích"]
+  DV --> DB1["tinh_toan/du_bao_ai.py"]
+  DV --> KN["tinh_toan/khuyen_nghi.py"]
+  DV --> NG["tinh_toan/nganh.py"]
+  DB1 --> LOI["tinh_toan/loi.py"]
+  KN --> LOI
+  ND --> TL["tro_ly_ai/tro_ly.py (khoá API)"]
+```
+
+### 0.2 Luồng một yêu cầu "tổng quan kho"
+
+```mermaid
+sequenceDiagram
+  participant W as web (chu_kho.js)
+  participant A as ung_dung.py
+  participant D as dich_vu.py
+  participant K as PhamVi(ma_kho)
+  participant T as tinh_toan
+  W->>A: GET /api/tong-quan (token)
+  A->>A: xac_thuc.nguoi_dung → vai trò, ma_kho
+  A->>D: tong_quan(PhamVi, hôm nay, chủ hàng?)
+  D->>K: mặt hàng, sổ bán, lô, đơn đang về, nhà cung cấp
+  D->>T: du_bao_ai.du_bao (nhớ theo nội dung sổ bán)
+  D->>T: khuyen_nghi.tinh → SS, ROP, Q*, ngày đặt muộn nhất
+  D-->>A: KPI + mỗi mặt hàng 3 câu (tình trạng, việc, lý do)
+  A-->>W: JSON
+```
+
+### 0.3 Vòng đời đơn hàng
+
+```mermaid
+stateDiagram-v2
+  [*] --> nhap: tao_don_nhap (gộp theo nhà cung cấp)
+  nhap --> da_dat: dat_don (chủ kho xác nhận, sinh liên kết)
+  da_dat --> ncc_xac_nhan: ncc_xac_nhan (qua liên kết, báo ngày giao)
+  da_dat --> da_ve: nhan_don
+  ncc_xac_nhan --> da_ve: nhan_don (tạo lô, ghi ngày về → lead time)
+  nhap --> [*]: huy_don
+  da_dat --> huy
+  ncc_xac_nhan --> huy
+```
+Đơn ở `da_dat` / `ncc_xac_nhan` được tính là **hàng đang về**.
+
+### 0.4 Muốn sửa X thì vào đâu (bản web)
+
+| Cần sửa | File / vị trí |
+|---|---|
+| Thêm / đổi màn hình, thứ tự menu của một vai trò | `web/js/ung_dung.js` (`MENU`, `TRANG_DAU`) + hàm `ve_*` trong `chu_kho.js` / `cac_ben.js` |
+| Thẻ "3 câu hỏi", định dạng số / ngày, thông báo, ngăn kéo | `web/js/nen_tang.js` |
+| Câu chữ tình trạng / việc nên làm / lý do / rủi ro | `may_chu/dich_vu.py` (`_loi_noi`) |
+| Nội dung hướng dẫn và các sơ đồ trong app | `web/js/huong_dan.js` (hằng `BUOC`, `LAN`, `TINH`, `TANG` ở đầu file) |
+| Màu, cỡ chữ, bố cục | `web/kieu.css` (biến ở `:root`) |
+| Công thức SS / ROP / Q* / ngày đặt muộn nhất, what-if CSL, đo CSL thực tế | `tinh_toan/khuyen_nghi.py` |
+| Mô hình dự báo, so sánh WAPE, phương sai | `tinh_toan/du_bao_ai.py` |
+| Thêm ngành, ngày sự kiện, tham số mặc định | `tinh_toan/nganh.py` (`GOI`) |
+| Ước lượng số ngày hàng về từ đơn đã nhận | `khuyen_nghi.uoc_luong_lead_time` · `dich_vu.lead_time_ncc` |
+| Kiểm tra dữ liệu nhập, thông báo lỗi tiếng Việt | `may_chu/dich_vu.py` (`_so`, `_mat_hang_hop_le`, `LoiNhap`) · file doanh số: `tinh_toan/loi.py` (`chuan_hoa_ban_hang`) |
+| Thêm đường dẫn API, quyền của vai trò | `may_chu/ung_dung.py` (`CHU_KHO`, `XEM_KHO`, `QUAN_TRI`) |
+| Đăng nhập thật thay tài khoản demo | `may_chu/xac_thuc.py` (`dang_nhap`) |
+| Nơi lưu, thêm bảng dữ liệu | `may_chu/kho_du_lieu.py` · tên bảng trong `du_lieu_mau.BANG` |
+| Dữ liệu mẫu, tài khoản demo | `may_chu/du_lieu_mau.py` |
+| Nhận diện ảnh: lời dặn, ngưỡng tự tin | `tro_ly_ai/nhan_dien.py` (`LOI_DAN`, `NGUONG_*`) |
+
+### 0.5 Quy tắc riêng của bản web
+
+- Phụ thuộc: `web → may_chu → tro_ly_ai → tinh_toan`. `tinh_toan/` không import `fastapi`; `dich_vu.py` không import `fastapi`
+  (kiểm thử bằng hàm thường); `ung_dung.py` không chứa công thức.
+- **Cách ly dữ liệu**: tầng dịch vụ chỉ đọc / ghi qua `PhamVi(kho, ma_kho)`. Chỉ ba chỗ được dùng kho dữ liệu trần: đăng nhập,
+  quản trị (`ds_khach`, `gia_han`: chỉ thông tin gói) và cổng nhà cung cấp (tra theo `ma_lien_ket`).
+- Chủ hàng chỉ được **xem** và chỉ thấy mặt hàng có `ma_chu_hang` của mình; quản trị bị chặn ở mọi đường dẫn số liệu kinh doanh.
+- Giao diện không tự tính công thức tồn kho: mọi con số và câu chữ đến từ API. Thuật ngữ kỹ thuật (ROP, SS, EOQ, CSL) chỉ hiện
+  trong mục "Xem chi tiết"; ngoài đó dùng tên thường (mức báo đặt hàng, hàng dự phòng, mức yên tâm, số ngày hàng về).
+- Người dùng nhập sai: ném `dich_vu.LoiNhap("câu tiếng Việt")` → API trả 400 `{"loi": ...}` → giao diện hiện nguyên văn.
+- Ngày lưu dạng chuỗi `YYYY-MM-DD`. "Hôm nay" lấy từ `dich_vu.hom_nay()` (test đặt `SMARTSTOCK_HOM_NAY`).
+- Dữ liệu SmartStock ở MongoDB database `smartstock_ai` (đổi bằng `SMARTSTOCK_MONGO_URI`). Test và chạy thử dùng `KhoTep()` trong
+  bộ nhớ hoặc `SMARTSTOCK_THU_MUC` tới thư mục tạm; **không** chạy `du_lieu_mau --lam-lai` trên dữ liệu thật khi chưa hỏi.
+- Test máy chủ không gọi dịch vụ AI thật (client giả, hoặc thay `tro_ly.doc_cau_hinh`).
+- JavaScript thuần dạng module, không thêm thư viện ngoài hay bước build. Chèn dữ liệu vào HTML luôn qua hàm `e()` (thoát ký tự).
+- Sửa giao diện web thì mở app xem đúng màn hình đó, cả ở bề ngang di động (375 px).
+
+---
+
 ## 1. Workflow mỗi lần chỉnh sửa (làm đúng thứ tự)
 
 1. **Xác định chỗ sửa**: tra bảng ở mục 4 "Muốn sửa X thì vào đâu"; chỉ mở file liên quan.
-2. **Chạy test làm mốc**: `python -m pytest tests -q`, ghi lại số test đang qua (hiện tại: **109**).
+2. **Chạy test làm mốc**: `python -m pytest tests -q`, ghi lại số test đang qua (hiện tại: **135**).
 3. **Sửa** theo quy tắc ở mục 5 và 6. Thay đổi nhỏ, đúng tầng; không đổi tên hàm công khai nếu không cần
    (test và trợ lý AI gọi theo tên).
 4. **Thêm / cập nhật test** cho hành vi mới: thuật toán → `tests/test_<module>.py`; giao diện → `tests/test_giao_dien.py`.
-5. **Chạy lại toàn bộ test**: phải qua hết, số test không giảm. Nên chạy thêm `python -m pyflakes app.py tinh_toan
+5. **Chạy lại toàn bộ test**: phải qua hết, số test không giảm. Nên chạy thêm `python -m pyflakes app.py may_chu tinh_toan
    giao_dien tro_ly_ai tests` (nếu máy có pyflakes) để bắt import thừa.
 6. **Sửa giao diện thì mở app xem**: `streamlit run app.py`, xem đúng trang đã sửa (test khói chỉ bắt lỗi, không bắt
    bố cục xấu). Chạy thử với sổ kiểm kho thì đặt `EOQ_THU_MUC_SO` tới thư mục tạm (mục 6).
@@ -43,7 +151,8 @@
 pip install -r requirements.txt
 python -m pytest tests -q                       # toàn bộ test (~20 giây), gồm test khói mọi trang và test MongoDB
 python -m pytest tests -q -k "not giao_dien"    # chỉ tầng tính toán + AI (~8 giây)
-streamlit run app.py                            # http://localhost:8501
+python -m uvicorn may_chu.ung_dung:app --port 8600   # bản web V1.1, http://localhost:8600
+streamlit run app.py                            # bản phân tích cũ, http://localhost:8501
 python pipeline.py --so-lan 1 --out <thư_mục_tạm>   # chạy thử nhanh, KHÔNG ghi đè output/
 python pipeline.py                              # chạy đầy đủ, ghi kết quả chính thức vào output/
 ```
@@ -57,7 +166,8 @@ aie_project/
 ├── README.md              ← giới thiệu + cách chạy (cho người)
 ├── app.py                 ← ĐIỂM VÀO Streamlit: chỉ điều phối thứ tự dựng dữ liệu và chọn trang
 ├── pipeline.py            ← ĐIỂM VÀO dòng lệnh: dữ liệu mô phỏng, mô phỏng lặp, xuất CSV/JSON/PNG vào output/
-├── tinh_toan/             ← TẦNG TÍNH TOÁN (numpy/pandas thuần, kiểm tra được bằng Excel)
+├── web/ · may_chu/        ← BẢN WEB V1.1 (xem mục 0)
+├── tinh_toan/             ← TẦNG TÍNH TOÁN (thêm cho V1.1: du_bao_ai.py, khuyen_nghi.py, nganh.py; xem mục 0)
 │   ├── loi.py             │  đọc/chuẩn hoá doanh số; dự báo mùa vụ + dự báo khởi động; kiểm định; SS/ROP/EOQ; mô phỏng 1 mặt hàng
 │   ├── nhieu_mat_hang.py  │  hàng dễ hỏng (Q10, θ), nhập gộp can-order, ràng buộc vốn/sức chứa, kế hoạch hôm nay, mô phỏng cửa hàng
 │   └── so_ghi.py          │  sổ kiểm kho: suy ra lượng bán, ước lượng ban đầu, đọc/ghi sổ + thiết lập (MongoDB hoặc CSV)
@@ -80,10 +190,10 @@ aie_project/
 │   ├── trang_ke_hoach.py      │  Thiết lập › Kế hoạch & vốn (vẽ trước khi nạp dữ liệu)
 │   ├── trang_tro_ly.py        │  Trợ giúp › Trợ lý AI
 │   └── trang_huong_dan.py     │  Trợ giúp › Hướng dẫn (nội dung tĩnh)
-├── tests/                 ← pytest: test_loi, test_nhieu_mat_hang, test_so_ghi, test_giai_doan_2..6, test_tro_ly, test_giao_dien
+├── tests/                 ← pytest: test_khuyen_nghi, test_may_chu (bản web), test_loi, test_nhieu_mat_hang, test_so_ghi, test_giai_doan_2..6, test_tro_ly, test_giao_dien
 ├── du_lieu_thu/           ← dữ liệu mẫu 8 mặt hàng cho người dùng tải lên VÀ cho test (không sửa tuỳ tiện)
 ├── output/                ← kết quả pipeline.py; app đọc output/du_lieu_lich_su_mo_phong_2023_2024.csv làm dữ liệu dùng thử
-├── tai_lieu/              ← DU_AN.md (hồ sơ dự án), NGHIEN_CUU_HANG_THUC_PHAM.md (tài liệu khoa học)
+├── tai_lieu/              ← DAC_TA_V1.1.md (đặc tả bản web), DU_AN.md (hồ sơ dự án), NGHIEN_CUU_HANG_THUC_PHAM.md (tài liệu khoa học)
 ├── du_lieu_cua_toi/       ← (KHÔNG có trong git) nơi lưu dự phòng dạng CSV khi MongoDB không chạy
 └── .streamlit/            ← config.toml (theme: màu, baseFontSize 18) · secrets.toml (API KEY, BÍ MẬT, không có trong git)
 ```
